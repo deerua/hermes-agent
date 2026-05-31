@@ -115,6 +115,7 @@ async def _stream_claude(
     prompt: str,
     session_id: str | None,
     system: str | None,
+    state: dict | None = None,
 ) -> AsyncGenerator[tuple[str, str, str], None]:
     """
     Async generator yielding (chunk_text, model, new_session_id).
@@ -122,6 +123,7 @@ async def _stream_claude(
     Thinking blocks are wrapped in <think>...</think> tags.
     AssistantMessage (full content) is skipped when StreamEvent deltas
     were already yielded to avoid duplicate output.
+    Optional `state` dict receives {'usage': {...}} from ResultMessage.
     """
     if system and not session_id:
         prompt = f"<context>\n{system}\n</context>\n\n{prompt}"
@@ -193,6 +195,8 @@ async def _stream_claude(
             elif isinstance(msg, ResultMessage):
                 if msg.session_id:
                     sid = msg.session_id
+                if msg.usage and state is not None:
+                    state["usage"] = msg.usage
 
         except MessageParseError as e:
             logger.debug("skip unparseable msg: %s", e)
@@ -269,9 +273,9 @@ async def chat_completions(request: Request):
         now = int(time.time())
 
         async def sse():
-            state = {"model": "claude-sonnet-4-6", "sid": sid or ""}
+            state = {"model": "claude-sonnet-4-6", "sid": sid or "", "usage": None}
             try:
-                async for chunk, m, s in _stream_claude(prompt, sid, system):
+                async for chunk, m, s in _stream_claude(prompt, sid, system, state=state):
                     if not chunk:
                         continue
                     state["model"], state["sid"] = m, s
@@ -290,8 +294,12 @@ async def chat_completions(request: Request):
                 if state["sid"]:
                     _sessions[key] = state["sid"]
                     _save_sessions()
+            raw_usage = state.get("usage") or {}
+            inp = raw_usage.get("input_tokens", 0)
+            out = raw_usage.get("output_tokens", 0)
             stop = {"id": cid, "object": "chat.completion.chunk", "created": now,
-                    "model": state["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    "model": state["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}}
             yield f"data: {json.dumps(stop)}\n\n"
             yield "data: [DONE]\n\n"
 
