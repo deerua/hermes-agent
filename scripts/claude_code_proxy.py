@@ -298,9 +298,15 @@ async def chat_completions(request: Request):
             inp = raw_usage.get("input_tokens", 0)
             out = raw_usage.get("output_tokens", 0)
             stop = {"id": cid, "object": "chat.completion.chunk", "created": now,
-                    "model": state["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out}}
+                    "model": state["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(stop)}\n\n"
+            # Usage in a separate empty-choices chunk — Hermes reads usage only
+            # when chunk.choices is empty (chat_completion_helpers.py:1818).
+            usage_pkt = {"id": cid, "object": "chat.completion.chunk", "created": now,
+                         "model": state["model"], "choices": [],
+                         "usage": {"prompt_tokens": inp, "completion_tokens": out,
+                                   "total_tokens": inp + out}}
+            yield f"data: {json.dumps(usage_pkt)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(sse(), media_type="text/event-stream")
