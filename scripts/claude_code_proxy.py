@@ -115,15 +115,13 @@ async def _stream_claude(
     prompt: str,
     session_id: str | None,
     system: str | None,
-    *,
-    emit_status: bool = False,
 ) -> AsyncGenerator[tuple[str, str, str], None]:
     """
     Async generator yielding (chunk_text, model, new_session_id).
-    Uses include_partial_messages=True for real-time streaming.
-    Thinking blocks are streamed inside <think>...</think> tags.
-    emit_status=True: first chunk is login info from the init SystemMessage,
-    emitted before any Claude thinking or text (no extra network call).
+    Uses include_partial_messages=True for real-time delta streaming.
+    Thinking blocks are wrapped in <think>...</think> tags.
+    AssistantMessage (full content) is skipped when StreamEvent deltas
+    were already yielded to avoid duplicate output.
     """
     if system and not session_id:
         prompt = f"<context>\n{system}\n</context>\n\n{prompt}"
@@ -138,6 +136,7 @@ async def _stream_claude(
     model = "claude-sonnet-4-6"
     sid = session_id or ""
     in_think = False
+    got_events = False  # True once any StreamEvent content delta was yielded
 
     async for msg in query(prompt=prompt, options=opts):
         if msg is None:
@@ -148,14 +147,6 @@ async def _stream_claude(
                 if not sid:
                     sid = msg.data.get("session_id", "")
                 _last_init.update(msg.data)
-                if emit_status:
-                    ver = msg.data.get("claude_code_version", "")
-                    src = msg.data.get("apiKeySource", "none")
-                    sub = _subscription_type()
-                    auth = "OAuth" if src == "none" else f"key:{src}"
-                    if sub:
-                        auth = f"{auth} ({sub})"
-                    yield (f"`🔑 {model} · {auth} · v{ver}`\n\n", model, sid)
 
             elif isinstance(msg, StreamEvent):
                 ev = msg.event
@@ -165,6 +156,7 @@ async def _stream_claude(
                     btype = ev.get("content_block", {}).get("type")
                     if btype == "thinking" and not in_think:
                         in_think = True
+                        got_events = True
                         yield ("<think>\n", model, sid)
                     elif btype == "text" and in_think:
                         in_think = False
@@ -174,8 +166,10 @@ async def _stream_claude(
                     delta = ev.get("delta", {})
                     dtype = delta.get("type")
                     if dtype == "thinking_delta":
+                        got_events = True
                         yield (delta.get("thinking", ""), model, sid)
                     elif dtype == "text_delta":
+                        got_events = True
                         yield (delta.get("text", ""), model, sid)
 
                 elif etype == "content_block_stop" and in_think:
@@ -183,14 +177,18 @@ async def _stream_claude(
                     yield ("\n</think>\n\n", model, sid)
 
             elif isinstance(msg, AssistantMessage):
-                if in_think:
-                    in_think = False
-                    yield ("\n</think>\n\n", model, sid)
-                for block in msg.content:
-                    if isinstance(block, ThinkingBlock) and block.thinking:
-                        yield (f"<think>\n{block.thinking}\n</think>\n\n", model, sid)
-                    elif isinstance(block, TextBlock) and block.text:
-                        yield (block.text, model, sid)
+                # Skip if StreamEvent deltas already delivered the content.
+                # With include_partial_messages=True the CLI always sends both,
+                # so AssistantMessage would be a full duplicate.
+                if not got_events:
+                    if in_think:
+                        in_think = False
+                        yield ("\n</think>\n\n", model, sid)
+                    for block in msg.content:
+                        if isinstance(block, ThinkingBlock) and block.thinking:
+                            yield (f"<think>\n{block.thinking}\n</think>\n\n", model, sid)
+                        elif isinstance(block, TextBlock) and block.text:
+                            yield (block.text, model, sid)
 
             elif isinstance(msg, ResultMessage):
                 if msg.session_id:
@@ -206,7 +204,7 @@ async def _run_claude(
     parts: list[str] = []
     model = "claude-sonnet-4-6"
     sid = session_id or ""
-    async for chunk, m, s in _stream_claude(prompt, session_id, system, emit_status=False):
+    async for chunk, m, s in _stream_claude(prompt, session_id, system):
         parts.append(chunk)
         model, sid = m, s
     return "".join(parts).strip() or "(no response)", model, sid
@@ -273,7 +271,7 @@ async def chat_completions(request: Request):
         async def sse():
             state = {"model": "claude-sonnet-4-6", "sid": sid or ""}
             try:
-                async for chunk, m, s in _stream_claude(prompt, sid, system, emit_status=True):
+                async for chunk, m, s in _stream_claude(prompt, sid, system):
                     if not chunk:
                         continue
                     state["model"], state["sid"] = m, s
