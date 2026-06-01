@@ -197,6 +197,7 @@ async def _stream_claude(
                     sid = msg.session_id
                 if msg.usage and state is not None:
                     state["usage"] = msg.usage
+                    logger.info("ResultMessage.usage raw: %s", msg.usage)
 
         except MessageParseError as e:
             logger.debug("skip unparseable msg: %s", e)
@@ -295,17 +296,27 @@ async def chat_completions(request: Request):
                     _sessions[key] = state["sid"]
                     _save_sessions()
             raw_usage = state.get("usage") or {}
-            inp = raw_usage.get("input_tokens", 0)
-            out = raw_usage.get("output_tokens", 0)
+            inp        = raw_usage.get("input_tokens", 0)
+            out        = raw_usage.get("output_tokens", 0)
+            cache_read = raw_usage.get("cache_read_input_tokens", 0)
+            cache_write = raw_usage.get("cache_creation_input_tokens", 0)
+            prompt_total = inp + cache_read + cache_write
+            logger.info("SSE usage: new=%s cache_read=%s cache_write=%s out=%s", inp, cache_read, cache_write, out)
             stop = {"id": cid, "object": "chat.completion.chunk", "created": now,
                     "model": state["model"], "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(stop)}\n\n"
-            # Usage in a separate empty-choices chunk — Hermes reads usage only
-            # when chunk.choices is empty (chat_completion_helpers.py:1818).
+            # Empty-choices usage chunk — Hermes reads usage only when chunk.choices
+            # is falsy (chat_completion_helpers.py:1818).
+            # prompt_tokens = total context (new + cache_read + cache_write) so
+            # normalize_usage can compute canonical.prompt_tokens correctly and
+            # the context compressor shows the real ctx: value in the footer.
             usage_pkt = {"id": cid, "object": "chat.completion.chunk", "created": now,
                          "model": state["model"], "choices": [],
-                         "usage": {"prompt_tokens": inp, "completion_tokens": out,
-                                   "total_tokens": inp + out}}
+                         "usage": {"prompt_tokens": prompt_total,
+                                   "completion_tokens": out,
+                                   "total_tokens": prompt_total + out,
+                                   "cache_read_input_tokens": cache_read,
+                                   "cache_creation_input_tokens": cache_write}}
             yield f"data: {json.dumps(usage_pkt)}\n\n"
             yield "data: [DONE]\n\n"
 
